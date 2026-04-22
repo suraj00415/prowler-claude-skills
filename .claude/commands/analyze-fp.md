@@ -13,17 +13,28 @@ Parse the arguments as follows:
 - **status**: (OPTIONAL) Filter by finding status: FAIL or PASS. If omitted, defaults to FAIL only.
 - **severity**: (OPTIONAL) Filter by severity: critical, high, medium, low. Comma-separated for multiple (e.g., "critical,high"). If omitted, defaults to critical and high.
 - **check**: (OPTIONAL) Filter by specific CHECK_ID pattern (e.g., "ec2_instance_port_ssh" or "s3_bucket_public"). Supports partial match.
-- **external-profile**: (OPTIONAL) A second AWS profile that belongs to a DIFFERENT AWS organization/account (external, untrusted). Used for cross-account verification of S3 bucket access, public snapshots, public AMIs, etc. If not provided, skip external-account checks but note they were skipped.
+- **external-profile**: (OPTIONAL but **STRONGLY RECOMMENDED for S3 findings**) A second AWS CLI profile that belongs to a DIFFERENT AWS account that is **NOT in the same AWS Organization** as the target account. Used for cross-account verification of S3 bucket access, public snapshots, public AMIs, etc. This simulates what an authenticated but unauthorized AWS user can access. If not provided, skip external-account checks but **warn the user** that S3 cross-account verification was skipped and results may be incomplete — a bucket could appear locked down from within the org but still be accessible to any authenticated AWS user outside the org.
 - **limit**: (OPTIONAL) Max number of findings to analyze in detail. Defaults to 10. Use "all" for no limit.
 - **region**: (OPTIONAL) Override region for AWS CLI calls. If omitted, use the region from each finding.
 
 ### Argument format examples:
 ```
-/prowler file=prowler-output-331560656580-20260422044210.csv profile=poc
-/prowler file=prowler-output-331560656580-20260422044210.csv profile=poc service=ec2 severity=critical
-/prowler file=prowler-output-331560656580-20260422044210.csv profile=poc service=ec2,s3,iam severity=critical,high
-/prowler file=prowler-output-331560656580-20260422044210.csv profile=poc service=s3 external-profile=external-pentest
-/prowler file=prowler-output-331560656580-20260422044210.csv profile=poc status=FAIL severity=critical,high check=ssh limit=5
+/analyze-fp file=prowler-output-331560656580-20260422044210.csv profile=poc
+/analyze-fp file=prowler-output-331560656580-20260422044210.csv profile=poc service=ec2 severity=critical
+/analyze-fp file=prowler-output-331560656580-20260422044210.csv profile=poc service=ec2,s3,iam severity=critical,high
+/analyze-fp file=prowler-output-331560656580-20260422044210.csv profile=poc service=s3 external-profile=external-pentest
+/analyze-fp file=prowler-output-331560656580-20260422044210.csv profile=poc status=FAIL severity=critical,high check=ssh limit=5
+```
+
+### Important: S3 cross-account verification
+When analyzing **S3 findings**, always provide `external-profile` for a complete assessment. The external profile must be:
+- An AWS account that is **NOT in the same AWS Organization** as the scanned account
+- Used to simulate what any authenticated AWS user outside your org can access
+- Without it, S3 findings may appear as false positives when they are actually accessible to external authenticated users
+
+Example:
+```
+/analyze-fp file=output.csv profile=poc service=s3 external-profile=personal-aws
 ```
 
 ## Procedure
@@ -98,9 +109,13 @@ For EACH filtered finding, run verification commands using `aws --profile <profi
    - `curl -s -o /dev/null -w "%{http_code}" https://<bucket>.s3.amazonaws.com/`
    - `curl -s -o /dev/null -w "%{http_code}" https://<bucket>.s3.<region>.amazonaws.com/?list-type=2`
 5. **External account check** (if external-profile provided):
-   - `aws s3 ls s3://<bucket>/ --profile <external-profile> --no-sign-request` (anonymous)
-   - `aws s3 ls s3://<bucket>/ --profile <external-profile>` (authenticated external account)
-   - `aws s3api get-object --bucket <bucket> --key <test-key> /dev/null --profile <external-profile>` if listing succeeds
+   The external-profile MUST be an AWS account NOT in the same AWS Organization. This is critical because S3 bucket policies and ACLs may grant access to "AuthenticatedUsers" (any valid AWS account) or use broad principal patterns that allow cross-org access.
+   - `aws s3 ls s3://<bucket>/ --profile <external-profile> --no-sign-request` (anonymous/unauthenticated)
+   - `aws s3 ls s3://<bucket>/ --profile <external-profile>` (authenticated as external out-of-org user)
+   - `aws s3api head-object --bucket <bucket> --key <test-key> --profile <external-profile>` if listing succeeds (verify object-level read)
+   - `aws s3api get-bucket-acl --bucket <bucket> --profile <external-profile>` (check if external user can read ACL)
+   - Report clearly whether the external authenticated user could: list objects, read objects, read ACL
+   - **If external-profile is NOT provided**: Print a prominent warning that S3 cross-account verification was skipped. Note that bucket policies granting access to `*` principal or `AuthenticatedUsers` cannot be fully validated without an external profile. Recommend the user re-run with `external-profile` for S3 findings.
 6. Check S3 account-level public access block: `aws s3control get-public-access-block --account-id <account-id>`
 
 **S3 encryption checks**:
@@ -148,6 +163,13 @@ For EACH finding analyzed, output a structured report:
 **Reason**: <one-line explanation>
 **Risk Level**: CRITICAL / HIGH / MEDIUM / LOW / INFORMATIONAL
 **Recommendation**: <action to take>
+
+**How an attacker could exploit this**:
+- Provide 3-5 concrete examples of how an attacker could exploit the verified misconfiguration.
+- Include example commands an attacker would use (e.g., ssh, curl, redis-cli, psql, kubectl, nc) to illustrate the attack surface.
+- Cover: initial access, credential theft (e.g., IMDS), lateral movement, data exfiltration, and privilege escalation where applicable.
+- Tailor examples to the specific resources attached (e.g., if RDS is attached, show database connection examples; if EKS nodes, show Kubelet API access).
+- These are READ-ONLY illustrative examples for the human security team to evaluate. Do NOT execute any of these commands yourself.
 ---
 ```
 
@@ -168,6 +190,21 @@ And a final count:
 - False Positives: X
 - Partially True: X
 - Skipped (over limit): X
+
+### Step 5: Save report to file
+
+After generating the full report (including all findings, attacker exploitation examples, summary table, and final counts), automatically save the complete report as a markdown file in the **same directory as the input CSV file**.
+
+- **Filename format**: `prowler-analysis-<ACCOUNT_UID>-<timestamp-from-csv-filename>.md`
+  - Extract the account UID and timestamp from the input CSV filename (e.g., `prowler-output-331560656580-20260422065605.csv` -> `prowler-analysis-331560656580-20260422065605.md`)
+  - If the CSV filename doesn't match this pattern, use `prowler-analysis-<ACCOUNT_UID>-<YYYYMMDDHHMMSS>.md` with the current timestamp.
+- **File contents**: The full report including:
+  - Report metadata header (source CSV, account, profile, filters, date)
+  - Filtered findings summary table
+  - All detailed finding verdicts with attacker exploitation examples
+  - Summary table and final counts
+  - Key observations and priority remediation order
+- Inform the user of the saved file path after writing.
 
 ## Important notes
 

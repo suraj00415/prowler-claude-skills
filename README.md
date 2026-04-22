@@ -35,7 +35,7 @@ A Claude Code custom slash command that automatically cross-verifies Prowler sec
 | `status` | Finding status: `FAIL` or `PASS` | `FAIL` |
 | `severity` | Severity level(s). **Comma-separated for multiple** | `critical,high` |
 | `check` | CHECK_ID pattern filter (partial match supported) | None |
-| `external-profile` | AWS profile from a **different AWS organization** for cross-account testing | None (skipped) |
+| `external-profile` | AWS profile from a **different AWS organization** (not same org) for cross-account S3/snapshot/AMI testing. **Strongly recommended for S3 findings.** | None (skipped with warning) |
 | `limit` | Max findings to analyze in detail. Use `all` for unlimited | `10` |
 | `region` | Override AWS region for all CLI calls | Region from finding |
 
@@ -66,14 +66,22 @@ A Claude Code custom slash command that automatically cross-verifies Prowler sec
 /analyze-fp file=prowler-output.csv profile=poc check=ssh limit=5
 ```
 
-### S3 with cross-account verification
+### S3 with cross-account verification (strongly recommended for S3)
 ```
 /analyze-fp file=prowler-output.csv profile=poc service=s3 external-profile=external-pentest
 ```
 This will:
 - Check bucket policies, ACLs, and public access blocks using your profile
 - Test **anonymous/unauthenticated** access via curl
-- Test **authenticated cross-account** access using the external profile (should be an AWS account NOT in your organization)
+- Test **authenticated cross-account** access using the external profile
+
+> **Why `external-profile` matters for S3**: A bucket may appear locked down from within your AWS Organization, but S3 bucket policies can grant access to `*` (any principal) or `AuthenticatedUsers` (any valid AWS account). The only way to verify this is by attempting access from an account **outside your AWS Organization**. Without it, the analysis may miss buckets that are accessible to any authenticated AWS user on the internet.
+
+#### Requirements for the external profile
+- Must be an AWS account that is **NOT in the same AWS Organization** as the scanned account
+- Only needs `s3:ListBucket`, `s3:GetObject`, and `s3:GetBucketAcl` permissions (these are tested against the target, not granted by IAM)
+- A personal AWS account or a dedicated pentesting account works well
+- If not provided, S3 findings will include a warning that cross-account verification was skipped
 
 ### Combined filters
 ```
@@ -153,200 +161,7 @@ This tool operates in **read-only mode**. It will:
 
 See [CLAUDE.md](.claude/CLAUDE.md) for the complete safety rules and API allowlist/blocklist.
 
-## Running Prowler effectively
-
-The more you pre-filter at scan time, the less work `/analyze-fp` has to do. Use these flags to produce focused, smaller CSV outputs.
-
-### Key flags to reduce noise
-
-#### 1. `--status` - Only export failures (most important flag)
-
-By default Prowler exports PASS + FAIL + MANUAL. Export only what you need:
-
-```bash
-# Only failures - dramatically reduces CSV size
---status FAIL
-
-# Failures + manual checks that need human review
---status FAIL MANUAL
-```
-
-#### 2. `--service` / `--services` - Scope to specific services
-
-Scan only the services you care about instead of all ~60+ services:
-
-```bash
-# Single service
---service ec2
-
-# Multiple services (space-separated)
---service ec2 s3 iam rds lambda
-
-# Common groupings:
-# Network exposure:   --service ec2 elb elbv2 rds
-# Data security:      --service s3 ebs rds dynamodb
-# Identity:           --service iam accessanalyzer sso
-# Logging:            --service cloudtrail cloudwatch
-```
-
-#### 3. `--severity` / `--severities` - Focus on what matters
-
-Skip low/informational findings and focus on actionable items:
-
-```bash
-# Critical and high only
---severity critical high
-
-# Critical, high, and medium
---severity critical high medium
-```
-
-#### 4. `--output-directory` and `--output-filename` - Organize scan outputs
-
-Separate scans into meaningful folders and names so you can reference them easily:
-
-```bash
-# Custom output directory
---output-directory /home/prowler/output/2026-04-22
-
-# Custom filename (without extension)
---output-filename ec2-critical-fails
-
-# Both together
---output-directory /home/prowler/output/weekly-scans \
---output-filename ec2-s3-critical-2026-04-22
-```
-
-#### 5. `--region` - Limit to specific regions
-
-Avoid scanning all regions if your infra is only in a few:
-
-```bash
-# Single region
---region us-east-1
-
-# Multiple regions
---region us-east-1 us-west-2 eu-west-1
-```
-
-#### 6. `--check` / `--checks` - Run specific checks only
-
-If you already know which checks you want to verify:
-
-```bash
-# Specific checks
---check ec2_instance_port_ssh_exposed_to_internet ec2_instance_port_rdp_exposed_to_internet
-
-# List available checks first
-prowler aws --list-checks
-```
-
-#### 7. `--compliance` - Scan against a specific framework
-
-Run only the checks required by a compliance framework:
-
-```bash
---compliance cis_6.0_aws
---compliance soc2_aws
---compliance hipaa_aws
---compliance pci_4.0_aws
---compliance nist_800_53_revision_5_aws
-```
-
-#### 8. `--excluded-service` / `--excluded-check` - Skip what you don't need
-
-```bash
-# Skip services you've already reviewed
---excluded-service cloudwatch guardduty
-
-# Skip specific checks that are known exceptions
---excluded-check ec2_instance_older_than_specific_days ec2_instance_detailed_monitoring_enabled
-```
-
-#### 9. `--resource-tag` / `--resource-arn` - Target specific resources
-
-```bash
-# Only scan resources with a specific tag
---resource-tag env=production
-
-# Only scan specific resource ARNs
---resource-arn arn:aws:ec2:us-east-1:123456789012:instance/i-0abc123
-```
-
-#### 10. `--mutelist-file` - Suppress known exceptions
-
-Create a YAML mutelist for findings you've already reviewed and accepted:
-
-```bash
---mutelist-file /home/prowler/.aws/prowler-mutelist.yaml
-```
-
-### Recommended scan recipes
-
-#### Quick critical-only scan for FP analysis
-```bash
-prowler aws \
-  --profile <profile> \
-  --status FAIL \
-  --severity critical high \
-  --service ec2 s3 iam rds \
-  --output-directory prowler-output/fp-analysis \
-  --output-filename critical-high-fails \
-  -M csv \
-  --no-banner
-```
-Then analyze with:
-```
-/analyze-fp file=fp-analysis/critical-high-fails.csv profile=<profile>
-```
-
-#### Network exposure audit
-```bash
-prowler aws \
-  --profile <profile> \
-  --status FAIL \
-  --severity critical high \
-  --service ec2 elb elbv2 rds \
-  --region us-east-1 \
-  --output-directory prowler-output/network-audit \
-  --output-filename network-exposure \
-  -M csv \
-  --no-banner
-```
-Then analyze with:
-```
-/analyze-fp file=network-audit/network-exposure.csv profile=<profile> service=ec2 check=exposed limit=20
-```
-
-#### S3 bucket security audit with cross-account testing
-```bash
-prowler aws \
-  --profile <profile> \
-  --status FAIL \
-  --service s3 \
-  --output-directory prowler-output/s3-audit \
-  --output-filename s3-public-checks \
-  -M csv \
-  --no-banner
-```
-Then analyze with:
-```
-/analyze-fp file=s3-audit/s3-public-checks.csv profile=<profile> service=s3 external-profile=<external-profile>
-```
-
-#### Compliance scan (e.g., CIS AWS 6.0)
-```bash
-prowler aws \
-  --profile <profile> \
-  --status FAIL \
-  --compliance cis_6.0_aws \
-  --output-directory prowler-output/compliance \
-  --output-filename cis6-failures \
-  -M csv \
-  --no-banner
-```
-
-### Tips to minimize `/analyze-fp` workload
+## Tips to minimize `/analyze-fp` workload
 
 | Tip | Why it helps |
 |-----|-------------|
