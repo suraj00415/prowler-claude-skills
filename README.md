@@ -43,41 +43,41 @@ A Claude Code custom slash command that automatically cross-verifies Prowler sec
 
 ### Basic - analyze all critical/high failures
 ```
-/analyze-fp file=prowler-output-331560656580-20260422044210.csv profile=poc
+/analyze-fp file=prowler-output.csv profile=poc
 ```
 
 ### Single service filter
 ```
-/analyze-fp file=prowler-output-331560656580-20260422044210.csv profile=poc service=ec2
+/analyze-fp file=prowler-output.csv profile=poc service=ec2
 ```
 
 ### Multiple services
 ```
-/analyze-fp file=prowler-output-331560656580-20260422044210.csv profile=poc service=ec2,s3,iam
+/analyze-fp file=prowler-output.csv profile=poc service=ec2,s3,iam
 ```
 
 ### Multiple severities
 ```
-/analyze-fp file=prowler-output-331560656580-20260422044210.csv profile=poc severity=critical,high,medium
+/analyze-fp file=prowler-output.csv profile=poc severity=critical,high,medium
 ```
 
 ### Specific check pattern
 ```
-/analyze-fp file=prowler-output-331560656580-20260422044210.csv profile=poc check=ssh limit=5
+/analyze-fp file=prowler-output.csv profile=poc check=ssh limit=5
 ```
 
 ### S3 with cross-account verification
 ```
-/analyze-fp file=prowler-output-331560656580-20260422044210.csv profile=poc service=s3 external-profile=external-pentest
+/analyze-fp file=prowler-output.csv profile=poc service=s3 external-profile=external-pentest
 ```
 This will:
-- Check bucket policies, ACLs, and public access blocks using `poc` profile
+- Check bucket policies, ACLs, and public access blocks using your profile
 - Test **anonymous/unauthenticated** access via curl
-- Test **authenticated cross-account** access using `external-pentest` profile (should be an AWS account NOT in your organization)
+- Test **authenticated cross-account** access using the external profile (should be an AWS account NOT in your organization)
 
 ### Combined filters
 ```
-/analyze-fp file=prowler-output-331560656580-20260422044210.csv profile=poc service=ec2,s3 status=FAIL severity=critical check=public limit=20
+/analyze-fp file=prowler-output.csv profile=poc service=ec2,s3 status=FAIL severity=critical check=public limit=20
 ```
 
 ## What it verifies
@@ -151,21 +151,11 @@ This tool operates in **read-only mode**. It will:
 - Never execute remediation commands (only suggests them)
 - Present remediation as recommendations for manual review
 
-See [CLAUDE.md](CLAUDE.md) for the complete safety rules and API allowlist/blocklist.
+See [CLAUDE.md](.claude/CLAUDE.md) for the complete safety rules and API allowlist/blocklist.
 
 ## Running Prowler effectively
 
 The more you pre-filter at scan time, the less work `/analyze-fp` has to do. Use these flags to produce focused, smaller CSV outputs.
-
-### Docker setup (recommended)
-
-```bash
-# Base command structure
-docker run -it --rm \
-  -v "$HOME/.aws:/home/prowler/.aws:ro" \
-  -v "$(pwd)/prowler-output:/home/prowler/output" \
-  prowlercloud/prowler:stable aws --profile <profile> [OPTIONS]
-```
 
 ### Key flags to reduce noise
 
@@ -248,7 +238,7 @@ If you already know which checks you want to verify:
 --check ec2_instance_port_ssh_exposed_to_internet ec2_instance_port_rdp_exposed_to_internet
 
 # List available checks first
-docker run --rm prowlercloud/prowler:stable aws --list-checks
+prowler aws --list-checks
 ```
 
 #### 7. `--compliance` - Scan against a specific framework
@@ -295,74 +285,62 @@ Create a YAML mutelist for findings you've already reviewed and accepted:
 
 #### Quick critical-only scan for FP analysis
 ```bash
-docker run -it --rm \
-  -v "$HOME/.aws:/home/prowler/.aws:ro" \
-  -v "$(pwd)/prowler-output:/home/prowler/output" \
-  prowlercloud/prowler:stable aws \
-  --profile poc \
+prowler aws \
+  --profile <profile> \
   --status FAIL \
   --severity critical high \
   --service ec2 s3 iam rds \
-  --output-directory /home/prowler/output/fp-analysis \
+  --output-directory prowler-output/fp-analysis \
   --output-filename critical-high-fails \
   -M csv \
   --no-banner
 ```
 Then analyze with:
 ```
-/analyze-fp file=fp-analysis/critical-high-fails.csv profile=poc
+/analyze-fp file=fp-analysis/critical-high-fails.csv profile=<profile>
 ```
 
 #### Network exposure audit
 ```bash
-docker run -it --rm \
-  -v "$HOME/.aws:/home/prowler/.aws:ro" \
-  -v "$(pwd)/prowler-output:/home/prowler/output" \
-  prowlercloud/prowler:stable aws \
-  --profile poc \
+prowler aws \
+  --profile <profile> \
   --status FAIL \
   --severity critical high \
   --service ec2 elb elbv2 rds \
   --region us-east-1 \
-  --output-directory /home/prowler/output/network-audit \
+  --output-directory prowler-output/network-audit \
   --output-filename network-exposure \
   -M csv \
   --no-banner
 ```
 Then analyze with:
 ```
-/analyze-fp file=network-audit/network-exposure.csv profile=poc service=ec2 check=exposed limit=20
+/analyze-fp file=network-audit/network-exposure.csv profile=<profile> service=ec2 check=exposed limit=20
 ```
 
 #### S3 bucket security audit with cross-account testing
 ```bash
-docker run -it --rm \
-  -v "$HOME/.aws:/home/prowler/.aws:ro" \
-  -v "$(pwd)/prowler-output:/home/prowler/output" \
-  prowlercloud/prowler:stable aws \
-  --profile poc \
+prowler aws \
+  --profile <profile> \
   --status FAIL \
   --service s3 \
-  --output-directory /home/prowler/output/s3-audit \
+  --output-directory prowler-output/s3-audit \
   --output-filename s3-public-checks \
   -M csv \
   --no-banner
 ```
 Then analyze with:
 ```
-/analyze-fp file=s3-audit/s3-public-checks.csv profile=poc service=s3 external-profile=external-pentest
+/analyze-fp file=s3-audit/s3-public-checks.csv profile=<profile> service=s3 external-profile=<external-profile>
 ```
 
 #### Compliance scan (e.g., CIS AWS 6.0)
 ```bash
-docker run -it --rm \
-  -v "$HOME/.aws:/home/prowler/.aws:ro" \
-  -v "$(pwd)/prowler-output:/home/prowler/output" \
-  prowlercloud/prowler:stable aws \
-  --profile poc \
+prowler aws \
+  --profile <profile> \
   --status FAIL \
   --compliance cis_6.0_aws \
-  --output-directory /home/prowler/output/compliance \
+  --output-directory prowler-output/compliance \
   --output-filename cis6-failures \
   -M csv \
   --no-banner
