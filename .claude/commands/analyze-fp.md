@@ -193,18 +193,49 @@ And a final count:
 
 ### Step 5: Save report to file
 
-After generating the full report (including all findings, attacker exploitation examples, summary table, and final counts), automatically save the complete report as a markdown file in the **same directory as the input CSV file**.
+After generating the full report (including all findings, attacker exploitation examples, summary table, and final counts), automatically save the complete report as **both a PDF and a markdown file** in the **same directory as the input CSV file**.
+
+#### PDF report (primary output)
+
+Generate a professional PDF using Python's `fpdf2` library (install with `pip install fpdf2` if needed). Write a Python script to a temporary file and execute it, rather than trying to inline complex Python in bash heredocs.
+
+- **Filename format**: `prowler-analysis-<ACCOUNT_UID>-<timestamp-from-csv-filename>.pdf`
+  - Extract the account UID and timestamp from the input CSV filename (e.g., `prowler-output-331560656580-20260422065605.csv` -> `prowler-analysis-331560656580-20260422065605.pdf`)
+  - If the CSV filename doesn't match this pattern, use `prowler-analysis-<ACCOUNT_UID>-<YYYYMMDDHHMMSS>.pdf` with the current timestamp.
+- **PDF formatting tips**:
+  - Use colored verdict badges (red=TRUE POSITIVE, green=FALSE POSITIVE, orange=PARTIALLY TRUE)
+  - Use colored risk badges (red=CRITICAL, orange=HIGH, yellow=MEDIUM, green=LOW)
+  - Use tables for summary data
+  - Use alternating row colors for readability
+  - Use Helvetica font (built-in, no Unicode issues) — use `-` instead of bullet characters (chr(8226) causes UnicodeEncodeError)
+  - Write the Python script to a `.py` file first, then execute it (avoids bash quoting/heredoc issues)
+  - **CRITICAL layout rule for key-value pairs**: Use explicit `set_xy()` positioning for both the key and value columns. Do NOT rely on `cell()` followed by `multi_cell()` without resetting position — this causes text to overflow to the right edge. The correct pattern:
+    ```python
+    def kv(self, key, value):
+        KEY_W = 42
+        VAL_W = self.w - self.l_margin - self.r_margin - KEY_W - 2
+        y_start = self.get_y()
+        self.set_xy(self.l_margin, y_start)          # pin key to left
+        self.cell(KEY_W, 5, key + ":", align="R")
+        self.set_xy(self.l_margin + KEY_W + 2, y_start)  # pin value after key
+        self.multi_cell(VAL_W, 5, value, new_x="LMARGIN", new_y="NEXT")
+    ```
+  - Always pass `new_x="LMARGIN", new_y="NEXT"` to `multi_cell` and badge `cell` calls so the cursor resets to the left margin after each element
+  - For `multi_cell`, always calculate remaining width explicitly (`self.w - self.get_x() - self.r_margin`) to avoid "not enough horizontal space" errors
+  - For bullet points, use `set_x()` to indent, then calculate remaining width before `multi_cell`
+
+#### Markdown report (secondary output)
+
+Also save a markdown version for easy viewing in terminals/editors.
 
 - **Filename format**: `prowler-analysis-<ACCOUNT_UID>-<timestamp-from-csv-filename>.md`
-  - Extract the account UID and timestamp from the input CSV filename (e.g., `prowler-output-331560656580-20260422065605.csv` -> `prowler-analysis-331560656580-20260422065605.md`)
-  - If the CSV filename doesn't match this pattern, use `prowler-analysis-<ACCOUNT_UID>-<YYYYMMDDHHMMSS>.md` with the current timestamp.
 - **File contents**: The full report including:
   - Report metadata header (source CSV, account, profile, filters, date)
   - Filtered findings summary table
   - All detailed finding verdicts with attacker exploitation examples
   - Summary table and final counts
   - Key observations and priority remediation order
-- Inform the user of the saved file path after writing.
+- Inform the user of both saved file paths after writing.
 
 ## Important notes
 
