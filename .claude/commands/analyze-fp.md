@@ -137,6 +137,141 @@ For EACH filtered finding, run verification commands using `aws --profile <profi
 #### Lambda / CloudTrail / CloudWatch / Other services:
 - Use the appropriate `aws <service> describe-*` commands to verify the specific configuration flagged by Prowler.
 
+#### Secrets Findings verification matrix:
+
+Secrets findings require two layers of validation: (1) confirm the secret pattern is real and not a false pattern match, and (2) confirm the secret is still valid/active. Always approach in that order.
+
+##### autoscaling_find_secrets_ec2_launch_configuration (ASG userdata secrets)
+
+These are almost always Elastic Beanstalk (`awseb-` prefix) launch configurations that embed **temporary STS credentials** in userdata bootstrap scripts. These credentials are short-lived (typically 1–24 hours). The key question is: **was the launch config created recently enough that the credentials could still be valid?**
+
+1. Get the launch configuration and its creation time:
+   ```
+   aws autoscaling describe-launch-configurations \
+     --launch-configuration-names <name> \
+     --profile <profile> --region <region> \
+     --query 'LaunchConfigurations[0].{Created:CreatedTime,UserData:UserData}'
+   ```
+2. Base64-decode the UserData to inspect it:
+   ```
+   python -c "import base64,sys; print(base64.b64decode(sys.stdin.read()).decode('utf-8','ignore'))" <<< "<base64-userdata>"
+   ```
+   Or with AWS CLI output: pipe through `| python -c "import sys,base64; d=sys.stdin.read().strip(); print(base64.b64decode(d).decode('utf-8','ignore'))"`
+3. Identify the secret type in the userdata:
+   - Look for `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` — these are temporary STS credentials
+   - Look for `aws configure` commands with embedded keys
+   - Look for database passwords, API tokens, or other long-lived secrets
+4. **Date-based verdict logic**:
+   - Calculate age: `now - CreatedTime`
+   - If the secret is an **STS temporary credential** (`AWS_SESSION_TOKEN` present) AND `CreatedTime` is **> 1 day ago** → **FALSE POSITIVE** (credential expired)
+   - If the secret is an **STS temporary credential** AND `CreatedTime` is **< 1 day ago** → **TRUE POSITIVE** (may still be valid; should not be in userdata regardless)
+   - If the secret is a **long-lived credential** (no session token, looks like an IAM access key) AND `CreatedTime` is any age → **TRUE POSITIVE** (long-lived keys in userdata are always a risk)
+   - If the secret is a **database password or API token** → **TRUE POSITIVE** regardless of age (should be in Secrets Manager)
+5. To confirm an IAM access key found in userdata is real vs expired, check:
+   ```
+   aws iam get-access-key-last-used --access-key-id <key-id> --profile <profile>
+   ```
+   If the key returns `NoSuchEntity` or shows as `Inactive` → **FALSE POSITIVE** (key deleted/deactivated).
+6. **Verdict**: FALSE POSITIVE if all of: (a) secret is STS temporary cred, (b) launch config is > 1 day old, (c) no active key found. Otherwise TRUE POSITIVE.
+
+##### awslambda_function_no_secrets_in_code (Lambda code secrets)
+
+Prowler scans Lambda deployment packages for secret-like patterns. High false positive rate because variable names like `SECRET_KEY`, `api_key`, `password` trigger even when the value is a placeholder or env var reference.
+
+1. Check what line and pattern was flagged:
+   - The `STATUS_EXTENDED` field contains: `lambda_function.py: Secret Keyword on line 86`
+   - Note the file name and line number
+2. Check if the function still exists and is active:
+   ```
+   aws lambda get-function-configuration --function-name <name> --profile <profile> --region <region>
+   ```
+3. Get the function code to inspect the flagged line:
+   ```
+   aws lambda get-function --function-name <name> --profile <profile> --region <region> \
+     --query 'Code.Location' --output text
+   ```
+   Then download and inspect: `curl -s "<presigned-url>" -o /tmp/fn.zip && unzip -p /tmp/fn.zip <filename> | sed -n '80,95p'`
+4. **Verdict logic**:
+   - If flagged line contains a hardcoded string value (not an env var lookup) AND the value looks like a real credential → **TRUE POSITIVE**
+   - If flagged line is `secret = os.environ.get('SECRET_KEY')` or similar env var reference → **FALSE POSITIVE** (variable name triggered the pattern, not a real secret)
+   - If flagged line is a comment, test fixture, or example string → **FALSE POSITIVE**
+   - If the function no longer exists → **RESOURCE NOT FOUND**
+
+##### awslambda_function_no_secrets_in_variables (Lambda environment variable secrets)
+
+1. Get the actual environment variable values:
+   ```
+   aws lambda get-function-configuration --function-name <name> \
+     --profile <profile> --region <region> \
+     --query 'Environment.Variables'
+   ```
+2. Check the flagged variable name (e.g., `SLACK_WEBHOOK_URL`, `DB_PASSWORD`, `API_KEY`):
+   - If the value is a real Slack webhook URL (`https://hooks.slack.com/...`) → **TRUE POSITIVE** (should be in Secrets Manager)
+   - If the value is a real AWS access key format (`AKIA...`) → **TRUE POSITIVE** — also check with `aws iam get-access-key-last-used`
+   - If the value is a placeholder like `changeme`, `<your-key-here>`, empty string → **FALSE POSITIVE**
+   - If the value points to an SSM/Secrets Manager path (`/prod/db/password`) → **FALSE POSITIVE** (using secrets management correctly)
+3. For webhook URLs and API tokens: attempt a lightweight validation call (e.g., a Slack ping) to confirm the token is still valid — do NOT send any actual messages or data. Just check if the auth returns 200 vs 401.
+
+##### cloudformation_stack_outputs_find_secrets (CloudFormation output secrets)
+
+CloudFormation stack outputs containing secrets is a critical finding — outputs are visible to anyone with `cloudformation:DescribeStacks` on the account.
+
+1. Describe the stack and check the outputs:
+   ```
+   aws cloudformation describe-stacks --stack-name <name> \
+     --profile <profile> --region <region> \
+     --query 'Stacks[0].Outputs'
+   ```
+2. Identify the flagged output key and its value
+3. Check if the value is a real AWS access key:
+   ```
+   aws iam get-access-key-last-used --access-key-id <key-id> --profile <profile>
+   ```
+4. **Verdict**: If the key is Active → **TRUE POSITIVE** (critical — exposed in CF output AND still valid). If Inactive/not found → **PARTIALLY TRUE** (was real, now expired).
+
+##### iam_user_with_temporary_credentials (IAM users with broad long-lived credentials)
+
+Note: despite the check name, this flags IAM users that have long-lived access keys with broad permissions — not temporary credentials. The name is misleading.
+
+1. List all active access keys for the user:
+   ```
+   aws iam list-access-keys --user-name <user> --profile <profile>
+   ```
+2. Check creation date and status of each key
+3. Check last used date:
+   ```
+   aws iam get-access-key-last-used --access-key-id <key-id> --profile <profile>
+   ```
+4. Check attached policies to understand the blast radius:
+   ```
+   aws iam list-attached-user-policies --user-name <user> --profile <profile>
+   aws iam list-user-policies --user-name <user> --profile <profile>
+   ```
+5. **Verdict**: TRUE POSITIVE if the user has active long-lived keys with non-IAM/STS permissions. Note last-used date and creation date for context. Flag keys > 90 days old as higher priority.
+
+##### iam_rotate_access_key_90_days (Keys not rotated in 90+ days)
+
+1. List keys and check creation date:
+   ```
+   aws iam list-access-keys --user-name <user> --profile <profile>
+   ```
+2. Check if key is still active and last-used:
+   ```
+   aws iam get-access-key-last-used --access-key-id <key-id> --profile <profile>
+   ```
+3. **Verdict**: TRUE POSITIVE if key is Active AND CreateDate > 90 days ago. If key is Inactive → FALSE POSITIVE (already deactivated, Prowler may have scanned before deactivation).
+
+##### iam_user_accesskey_unused (Unused access keys)
+
+1. Check last-used date: `aws iam get-access-key-last-used --access-key-id <key-id> --profile <profile>`
+2. **Verdict**: TRUE POSITIVE if key is Active AND has never been used (LastUsedDate = N/A) or not used in > 90 days. Recommend deactivating unused keys.
+
+##### iam_user_two_active_access_key (Two active keys)
+
+1. List both keys: `aws iam list-access-keys --user-name <user> --profile <profile>`
+2. Check last-used for both — if one is unused, it's likely forgotten and should be deleted.
+3. **Verdict**: TRUE POSITIVE if both keys are Active. Note if one is never used (higher risk).
+
 ### Step 3: Generate the verdict report
 
 For EACH finding analyzed, output a structured report:
@@ -197,32 +332,103 @@ After generating the full report (including all findings, attacker exploitation 
 
 #### PDF report (primary output)
 
-Generate a professional PDF using Python's `fpdf2` library (install with `pip install fpdf2` if needed). Write a Python script to a temporary file and execute it, rather than trying to inline complex Python in bash heredocs.
+Use the **report template** in `templates/` directory of this repo (`prowler-claude-skills/templates/`). This ensures consistent formatting across all team members and service types.
+
+**Required packages**: `pip install fpdf2 matplotlib`
 
 - **Filename format**: `prowler-analysis-<ACCOUNT_UID>-<timestamp-from-csv-filename>.pdf`
   - Extract the account UID and timestamp from the input CSV filename (e.g., `prowler-output-331560656580-20260422065605.csv` -> `prowler-analysis-331560656580-20260422065605.pdf`)
-  - If the CSV filename doesn't match this pattern, use `prowler-analysis-<ACCOUNT_UID>-<YYYYMMDDHHMMSS>.pdf` with the current timestamp.
-- **PDF formatting tips**:
-  - Use colored verdict badges (red=TRUE POSITIVE, green=FALSE POSITIVE, orange=PARTIALLY TRUE)
-  - Use colored risk badges (red=CRITICAL, orange=HIGH, yellow=MEDIUM, green=LOW)
-  - Use tables for summary data
-  - Use alternating row colors for readability
-  - Use Helvetica font (built-in, no Unicode issues) — use `-` instead of bullet characters (chr(8226) causes UnicodeEncodeError)
-  - Write the Python script to a `.py` file first, then execute it (avoids bash quoting/heredoc issues)
-  - **CRITICAL layout rule for key-value pairs**: Use explicit `set_xy()` positioning for both the key and value columns. Do NOT rely on `cell()` followed by `multi_cell()` without resetting position — this causes text to overflow to the right edge. The correct pattern:
-    ```python
-    def kv(self, key, value):
-        KEY_W = 42
-        VAL_W = self.w - self.l_margin - self.r_margin - KEY_W - 2
-        y_start = self.get_y()
-        self.set_xy(self.l_margin, y_start)          # pin key to left
-        self.cell(KEY_W, 5, key + ":", align="R")
-        self.set_xy(self.l_margin + KEY_W + 2, y_start)  # pin value after key
-        self.multi_cell(VAL_W, 5, value, new_x="LMARGIN", new_y="NEXT")
-    ```
-  - Always pass `new_x="LMARGIN", new_y="NEXT"` to `multi_cell` and badge `cell` calls so the cursor resets to the left margin after each element
-  - For `multi_cell`, always calculate remaining width explicitly (`self.w - self.get_x() - self.r_margin`) to avoid "not enough horizontal space" errors
-  - For bullet points, use `set_x()` to indent, then calculate remaining width before `multi_cell`
+
+##### How to use the template
+
+Write a Python script (`.py` file) that imports and uses the template. The template lives at `prowler-claude-skills/templates/` and provides two classes:
+
+- `ProwlerReport` — the PDF builder with all layout/styling built in
+- `ChartGenerator` — generates dark-themed matplotlib charts as PNGs
+
+**Script naming and location**:
+- Save the script as `gen_report-<ACCOUNT_UID>-<timestamp>.py` in the **same directory as the input CSV file** (e.g., `gen_report-331560656580-20260422073611.py`)
+- **DO NOT delete it after running** — the user may want to re-run it manually to regenerate the PDF without re-running the full analysis
+- Execute it with `python <path>` to generate the PDF
+
+**The script should add the template directory to sys.path, then follow this pattern:**
+
+```python
+import sys
+sys.path.insert(0, r"<absolute-path-to-prowler-claude-skills>")  # parent of templates/
+from templates import ProwlerReport, ChartGenerator
+
+# 1. Generate charts
+cg = ChartGenerator()
+chart_paths = cg.generate_all(
+    verdicts={"TRUE POSITIVE": 12, "FALSE POSITIVE": 5, "PARTIALLY TRUE": 2},
+    risks={"CRITICAL": 2, "HIGH": 3, "MEDIUM": 7, "LOW": 6},
+    exposure={"Truly Public": 12, "IP-Restricted": 5, "VPC-Only": 1},
+    regions={"us-east-1": 16, "eu-west-1": 3},
+)
+
+# 2. Build report using high-level methods
+report = ProwlerReport()
+report.cover(title="Prowler S3 Analysis Report", subtitle="...", account_id="123456789012",
+             metadata={"Date": "...", "Profile": "...", ...})
+report.executive_summary(risk_posture="CRITICAL", summary_text="...",
+    metrics={"Total\nFindings": 19, "True\nPositives": 12, ...},
+    top_findings=["bucket-x: config leaked...", ...],
+    warnings=[("Title", "Body text")])
+report.charts_page(chart_paths)
+report.summary_table(headers=["#","Resource","Verdict","Risk"], rows=[...], col_widths=[10,90,50,40])
+report.findings_section("Critical & High Risk", [{"num":"1", "check":"...", "bucket":"...", "region":"...", "verdict":"TRUE POSITIVE", "risk":"CRITICAL", "policy":"...", "anon":"...", "ext":"...", "reason":"...", "rec":"...", "exploit":["..."]}])
+report.findings_section_compact("Medium & Low Risk", [("2","bucket","region","MEDIUM","details","rec")])
+report.false_positives_section([("3","bucket","region","IP-restricted")], explanation="...")
+report.remediation_section([("IMMEDIATE","target","description"), ...])
+report.save(r"<absolute-path-to-output.pdf>")
+cg.cleanup()
+```
+
+See `templates/example_usage.py` for a complete working example.
+
+##### Available ProwlerReport methods
+
+| Method | Purpose |
+|--------|---------|
+| `cover(title, subtitle, account_id, metadata)` | Branded cover page with dark blue banner |
+| `executive_summary(risk_posture, summary_text, metrics, top_findings, warnings)` | Exec summary with metric cards, top findings, warning boxes |
+| `charts_page(chart_paths)` | 2x2 chart grid from ChartGenerator PNGs |
+| `summary_table(headers, rows, col_widths)` | Findings summary table on new page |
+| `findings_section(title, findings_list)` | Detailed finding cards with exploit examples |
+| `findings_section_compact(title, compact_list)` | Compact cards for medium/low risk |
+| `false_positives_section(fp_list, explanation)` | False positive section with explanation |
+| `remediation_section(items)` | Priority-ordered remediation with colored badges |
+| `save(path)` | Write PDF to disk |
+
+Low-level helpers also available: `section_title()`, `subsection_title()`, `badge()`, `verdict_badge()`, `risk_badge()`, `verdict_risk_badges()`, `kv()`, `body_text()`, `bullet()`, `separator()`, `data_table()`, `warning_box()`, `safe_page_break()`.
+
+##### ChartGenerator methods
+
+| Method | Purpose |
+|--------|---------|
+| `generate_all(verdicts, risks, exposure, regions)` | Generate all 4 charts, returns dict of PNG paths |
+| `donut(data, title, colors, filename)` | Single donut chart |
+| `hbar(data, title, colors, filename)` | Single horizontal bar chart |
+| `cleanup()` | Remove temp PNG files |
+
+##### PDF page structure (in order)
+
+1. **Cover page** — title banner, account ID, metadata
+2. **Executive Summary** — risk posture badge, metric cards, top findings, warnings
+3. **Charts page** — verdict donut, risk severity bars, exposure types, region distribution (2x2 grid)
+4. **Findings Summary Table** — all findings at a glance
+5. **Detailed Verdicts** — grouped by risk (CRITICAL first, then HIGH, MEDIUM, LOW)
+6. **Priority Remediation** — ordered action items with priority badges
+
+##### Important formatting notes
+
+- The template handles all layout, colors, fonts, and page breaks automatically
+- All key-value pairs use `set_xy()` positioning — no overflow issues
+- `safe_page_break(need)` is called before every finding block — no clipping
+- Charts use a consistent dark theme with white text
+- Use `-` for bullets (not Unicode bullet char which causes encoding errors)
+- The title in `cover()` should reflect the service: "Prowler S3 Analysis Report", "Prowler EC2 Analysis Report", etc.
 
 #### Markdown report (secondary output)
 
@@ -231,11 +437,12 @@ Also save a markdown version for easy viewing in terminals/editors.
 - **Filename format**: `prowler-analysis-<ACCOUNT_UID>-<timestamp-from-csv-filename>.md`
 - **File contents**: The full report including:
   - Report metadata header (source CSV, account, profile, filters, date)
+  - Executive summary paragraph
   - Filtered findings summary table
   - All detailed finding verdicts with attacker exploitation examples
   - Summary table and final counts
   - Key observations and priority remediation order
-- Inform the user of both saved file paths after writing.
+- Inform the user of all saved file paths after writing: the PDF, the markdown file, and the `gen_report-*.py` script.
 
 ## Important notes
 
